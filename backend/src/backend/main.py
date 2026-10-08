@@ -9,6 +9,10 @@ from sqlalchemy.exc import IntegrityError
 from .database import engine, get_db
 from .models import models
 from .schemas import schemas
+import time
+import uuid
+from fastapi import BackgroundTasks
+from .database import SessionLocal
 
 app = FastAPI(
     title="Daisy Channel Manager - Sujet A",
@@ -173,3 +177,100 @@ async def receive_artisia_webhook(
 
     db.commit()
     return {"status": "acknowledged", "type": payload.type}
+
+def sync_booking_to_artisia(task_id: int):
+    """
+    Tâche de fond qui tourne en coulisses.
+    Elle simule l'appel à l'API capricieuse d'Artisia.
+    """
+    # On DOIT ouvrir une nouvelle session DB car celle de la route HTTP est déjà fermée
+    db = SessionLocal()
+    try:
+        task = db.query(models.OutboxTask).filter(models.OutboxTask.id == task_id).first()
+        if not task or task.status != "pending":
+            return
+        
+        print(f"\n[BACKGROUND] 🚀 Début de la synchro pour la tâche {task_id}...")
+        
+        # On simule les 5 secondes de latence d'Artisia
+        time.sleep(5)
+        
+        # On simule la réponse de succès d'Artisia
+        fake_artisia_id = f"art_bk_fake_{uuid.uuid4().hex[:6]}"
+        
+        # On met à jour notre réservation locale avec l'ID du partenaire
+        booking = db.query(models.Booking).filter(models.Booking.id == task.payload["booking_id"]).first()
+        if booking:
+            booking.external_id = fake_artisia_id
+        
+        task.status = "success"
+        db.commit()
+        print(f"[BACKGROUND] Succès ! Tâche {task_id} synchronisée. ID Artisia: {fake_artisia_id}\n")
+    except Exception as e:
+        print(f"[BACKGROUND] Erreur réseau avec Artisia: {e}")
+        # Ici on gérerait la logique de retry (relancer plus tard)
+    finally:
+        db.close()
+
+
+@app.post("/daisy/bookings", tags=["Daisy Back-office"])
+def create_daisy_booking(
+    req: schemas.CreateDaisyBookingRequest,
+    background_tasks: BackgroundTasks,
+    db: DbSession = Depends(get_db)
+):
+    """
+    Route appelée par l'artisan depuis son interface Daisy.
+    Doit répondre IMMÉDIATEMENT, quoi qu'il arrive du côté d'Artisia.
+    """
+    # 1. Verrou pessimiste pour être sûr de la capacité
+    session_obj = (
+        db.query(models.Session)
+        .filter(models.Session.id == req.session_id)
+        .with_for_update()
+        .first()
+    )
+    
+    if not session_obj:
+        raise HTTPException(status_code=404, detail="Créneau introuvable.")
+        
+    available = session_obj.total_capacity - (session_obj.daisy_booked + session_obj.partner_booked)
+    if available < req.seats:
+        raise HTTPException(status_code=400, detail="Stock insuffisant.")
+        
+    # 2. Mise à jour du stock et création de la réservation Daisy
+    session_obj.daisy_booked += req.seats
+    booking_id = f"daisy_{uuid.uuid4().hex[:8]}"
+    
+    new_booking = models.Booking(
+        id=booking_id,
+        session_id=session_obj.id,
+        source="daisy",
+        seats=req.seats,
+        status="confirmed"
+    )
+    db.add(new_booking)
+    
+    # 3. PATTERN OUTBOX : On enregistre l'ordre de contacter Artisia
+    # Tout ça fait partie de la MÊME transaction. Si un truc plante, tout s'annule.
+    outbox_task = models.OutboxTask(
+        session_id=session_obj.id,
+        payload={
+            "action": "create_booking",
+            "booking_id": booking_id,
+            "seats": req.seats
+        },
+        status="pending"
+    )
+    db.add(outbox_task)
+    db.commit()
+    db.refresh(outbox_task)
+    
+
+    background_tasks.add_task(sync_booking_to_artisia, outbox_task.id)
+    
+    return {
+        "status": "success",
+        "message": "Réservation confirmée, synchronisation partenaire en cours.",
+        "booking_id": booking_id
+    }
