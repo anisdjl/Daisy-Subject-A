@@ -1,3 +1,4 @@
+# models.py
 from sqlalchemy import Column, Integer, String, DateTime, JSON
 from sqlalchemy.sql import func
 from ..database import Base
@@ -7,8 +8,8 @@ class Session(Base):
     
     id = Column(String, primary_key=True, index=True)
     total_capacity = Column(Integer, nullable=False)
-    daisy_booked = Column(Integer, default=0)
-    partner_booked = Column(Integer, default=0)
+    daisy_booked = Column(Integer, default=0, nullable=False)
+    partner_booked = Column(Integer, default=0, nullable=False)
 
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
@@ -22,12 +23,14 @@ class OutboxTask(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String, nullable=False)
     payload = Column(JSON, nullable=False)
-    status = Column(String, default="pending") # 'pending', 'success', 'failed'
+    status = Column(String, default="pending")
 
 class Booking(Base):
     __tablename__ = "bookings"
     
     id = Column(String, primary_key=True, index=True)
     session_id = Column(String, nullable=False)
-    source = Column(String, nullable=False) # 'daisy' ou 'artisia'
-    external_id = Column(String, nullable=True) # ID chez le partenaire s'il existe
+    source = Column(String, nullable=False)
+    external_id = Column(String, nullable=True)
+    seats = Column(Integer, default=1, nullable=False)
+    status = Column(String, default="confirmed")
