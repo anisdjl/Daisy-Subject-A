@@ -1,62 +1,66 @@
-# Daisy — Sujet A : Synchronisation & Gestion de Concurrence
+# Daisy — Sujet A : Synchronisation sans surréservation
 
-Ce dépôt contient l'implémentation du moteur de synchronisation bidirectionnelle entre Daisy et la plateforme partenaire fictive Artisia, en prévenant les surréservations et en isolant l'artisan des défaillances de l'API externe.
+Ce projet gère la synchronisation des réservations entre Daisy et la plateforme partenaire Artisia, en protégeant les stocks de l'artisan et en évitant que son écran ne rame quand l'API externe plante ou traîne.
 
 ---
 
-## PARTIE 1 — Réponses aux questions du Sujet A
+## PARTIE 1 — Les questions du Sujet A
 
 ### 1. Deux clients réservent la dernière place au même instant (Daisy vs Artisia). Que se passe-t-il ? Le système peut-il surréserver ?
 
-**Ce qui se passe dans mon implémentation :**
+**Dans mon code :**
 
-- **Côté Daisy** (`POST /daisy/bookings`) : une transaction PostgreSQL s'ouvre et pose un verrou pessimiste strict via `SELECT ... FOR UPDATE` sur la ligne du créneau (`Session`).
-- **Côté Artisia** (`POST /webhook/artisia`) : le webhook arrive pour notifier une réservation prise chez eux. Il tente également un `SELECT ... FOR UPDATE` sur ce même créneau.
+Quand une réservation arrive (via Daisy ou via le webhook Artisia), le code met un verrou strict sur la ligne du cours dans la base de données (`SELECT ... FOR UPDATE`).
 
-PostgreSQL force un ordre d'exécution séquentiel :
+PostgreSQL traite les requêtes l'une après l'autre :
 
-- **Si Daisy prend le verrou en premier :** le stock Daisy passe à 1, la capacité restante tombe à 0, la transaction commit. Le webhook Artisia prend ensuite le verrou, constate que `available == 0`, refuse d'altérer le stock numérique et enregistre la réservation avec le statut `conflict_overbooked`.
-- **Si le webhook Artisia prend le verrou en premier :** le webhook incrémente `partner_booked`, le stock restant tombe à 0, la transaction commit. La requête Daisy tente ensuite de réserver, voit 0 place disponible et renvoie immédiatement une erreur `400 Bad Request: Stock insuffisant`. Le client Daisy est rejeté avant paiement.
+1. La première requête prend le verrou, réserve la place restante (stock → 0) et valide.
+2. La deuxième attend son tour. Quand le verrou se libère, elle entre, constate qu'il reste 0 place et refuse la vente.
+   - **Si la vente venait de Daisy :** le client reçoit une erreur directe « Plus de place » avant d'avoir pu payer.
+   - **Si la vente venait d'Artisia :** comme le client a déjà payé chez eux, on refuse de passer le stock à -1. On note la réservation à part avec le statut `conflict_overbooked` pour prévenir l'artisan.
 
-**Le système peut-il surréserver dans la réalité ?**
+**Est-ce que le système peut surréserver dans la vraie vie ?**
 
-Oui, physiquement. Daisy et Artisia forment un système distribué sans commit à deux phases (2PC). Artisia vend la place sur sa propre plateforme avant d'envoyer le webhook. Si les deux réservations sont validées localement sur leurs plateformes respectives à la même milliseconde, la surréservation dans le monde réel est déjà consommée chez Artisia avant même que le webhook n'atteigne Daisy.
+Oui, physiquement. Artisia valide la vente sur son propre site avant d'envoyer son webhook à Daisy. Si un client réserve sur Artisia et un autre sur Daisy à la même seconde, deux personnes ont acheté la même place avant même qu'Artisia ne nous prévienne. Aucun code au monde ne peut empêcher ce décalage temporel entre deux serveurs distants.
 
-**Comment mon système l'encaisse :**
+**Ce que mon code fait face à ça :**
 
-Il refuse la corruption silencieuse. Le stock local ne descend jamais sous zéro (pas de capacité à -1). La réservation excédentaire est tracée en base avec le statut `conflict_overbooked`, ce qui permet au back-office d'alerter l'artisan pour arbitrage manuel sans casser la cohérence comptable du créneau.
+Il refuse de masquer le problème. Il ne corrompt pas les comptes (pas de stock négatif). Il isole la réservation en trop pour que l'artisan sache exactement qui contacter.
 
 ---
 
-### 2. Le partenaire est injoignable pendant 20 minutes. Que voit l'artisan ? Au retour du service, comment rattrapes-tu l'écart ?
+### 2. Le partenaire est en panne pendant 20 minutes. Que voit l'artisan ? Au retour du service, comment rattrapes-tu le retard ?
 
-**Ce que voit l'artisan pendant la panne :**
+**Pendant la panne :**
 
-L'artisan continue de travailler normalement dans Daisy. Lorsqu'il crée une réservation locale, le système répond en moins de 50 ms.
+L'artisan utilise Daisy normalement. Quand il prend une réservation, l'écran répond instantanément (en moins de 50 ms).
 
-Grâce au *Transactional Outbox pattern*, l'opération locale est commitée en base avec un ordre de synchronisation stocké dans `outbox_tasks`. L'interface affiche la réservation comme confirmée dans Daisy avec un statut « Synchro partenaire en attente ». L'artisan ne subit aucun freeze d'écran ni aucune erreur 500.
+On applique le principe de l'Outbox : on enregistre la réservation dans Daisy et on dépose un ordre de mission dans la table `outbox_tasks` au même moment. Daisy n'attend pas la réponse d'Artisia pour dire « c'est bon » à l'artisan.
 
-**Comment l'écart est rattrapé au retour du service :**
+**Au retour du service :**
 
-- **Flux Daisy → Artisia (sortant) :** les tâches `pending` dans `outbox_tasks` sont dépilées.
-  - **Piège d'Artisia :** son endpoint `POST /sessions/{id}/bookings` n'est pas idempotent. Pour éviter les doublons lors des retries post-panne, le worker effectue d'abord un `GET /sessions` chez Artisia pour vérifier l'état réel avant de rejouer les réservations, ou pousse un `PATCH /sessions/{id}` avec la capacité restante recalculée.
-- **Flux Artisia → Daisy (entrant) :** Artisia rejoue ses webhooks en attente (selon sa politique de retry à 1 min, 5 min, 30 min, 2 h). Dès réception, la table `webhook_events` filtre les doublons éventuels et applique les réservations manquantes sous verrou pessimiste.
+- **De Daisy vers Artisia :** un script dépile les tâches en attente dans `outbox_tasks`. Comme l'API d'Artisia ne permet pas de rejouer des réservations sans risquer de créer des doublons, on fait un tour de vérification (un `GET` sur leurs sessions) pour comparer les états réels avant d'envoyer les mises à jour.
+- **D'Artisia vers Daisy :** Artisia rejoue automatiquement ses webhooks en attente. Dès qu'ils arrivent, notre filtre anti-doublon fait le tri et met à jour le planning.
 
 ---
 
 ### 3. Le même webhook arrive trois fois. Comment tu t'en protèges, et à quel coût ?
 
-**La protection :**
+**La protection (l'idempotence) :**
 
-Une barrière d'idempotence au niveau du stockage via la table `webhook_events`, dont la clé primaire est l'`event_id`.
+Chaque message d'Artisia a un identifiant unique (`event_id`). Quand un message arrive, on essaie d'insérer cet identifiant dans la table `webhook_events`.
 
-À chaque réception de webhook, une tentative d'insertion (`INSERT`) est soumise avec `db.flush()`. Si l'ID est déjà présent, PostgreSQL déclenche immédiatement une violation de contrainte d'unicité (`IntegrityError`). Le code intercepte l'exception, effectue un rollback et retourne immédiatement un `200 OK` avec `{"status": "ignored", "reason": "already_processed"}` pour stopper les retries d'Artisia sans exécuter la logique métier.
+- **Si l'ID n'existe pas :** la base l'enregistre, et on traite la réservation.
+- **Si l'ID existe déjà :** la base refuse l'insertion (erreur de clé unique). On annule immédiatement (rollback) et on renvoie un code `200 OK` à Artisia pour lui dire « message reçu, arrête d'insister », sans toucher aux places.
 
 **Le coût :**
 
-- **En calcul / latence :** une écriture indexée sur clé primaire B-Tree, soit moins d'une milliseconde d'overhead.
-- **En stockage :** une ligne par événement (`event_id` en VARCHAR + timestamp), soit quelques dizaines d'octets. Pour 10 000 événements par jour, cela représente moins de 50 Mo par an.
-- **Choix d'arbitrage :** stocker cette clé dans PostgreSQL plutôt que dans un cache Redis garantit l'atomicité transactionnelle : l'écriture de l'événement et la mise à jour des stocks partagent le même moteur sans risque de désynchronisation entre cache et base.
+- **Temps :** une simple écriture en base, invisible pour les performances (moins d'une milliseconde).
+- **Espace disque :** une ligne par événement dans la base (quelques octets). Même avec des milliers d'événements par jour, cela pèse quelques dizaines de mégaoctets par an.
+
+**Pourquoi en base et pas dans un cache ?**
+
+Parce qu'enregistrer l'ID du message et modifier les places dans la même base garantit que si le serveur plante au milieu, tout s'annule en même temps. Avec un cache à côté, les deux systèmes risquent de ne plus être d'accord.
 
 ---
 
@@ -64,9 +68,9 @@ Une barrière d'idempotence au niveau du stockage via la table `webhook_events`,
 
 **Mon choix : Ne jamais surréserver.**
 
-**Mon discours à l'artisan :**
+**Ce que je dis à l'artisan :**
 
-> « Si je bloque une vente par précaution, vous perdez un gain potentiel sur un cours. Mais si j'autorise une survente, vous perdez de l'argent réel : Artisia conserve sa commission même si nous annulons, vous devez gérer un client furieux qui se déplace pour rien un samedi après-midi, et vous n'avez pas de 9ème tour de potier physique à lui installer. Daisy est là pour protéger votre sérénité et la réputation de votre atelier, pas pour vous fabriquer des crises en direct. »
+> « Bloquer une vente par prudence vous fait rater un gain potentiel. Mais une surréservation vous coûte de l'argent réel : Artisia garde sa commission même si on annule, vous devez gérer un client mécontent qui se déplace pour rien le samedi, et vous n'avez pas de tour de potier en rab dans l'atelier. Daisy est là pour protéger votre planning et votre réputation, pas pour vous créer des urgences ingérables le week-end. »
 
 ---
 
@@ -76,23 +80,23 @@ Une barrière d'idempotence au niveau du stockage via la table `webhook_events`,
 
 **Temps passé :** environ 4 heures.
 
-**Ordre d'attaque :**
+**Ordre de travail :**
 
-1. Analyse de `partner-api.md` pour cibler les faiblesses d'Artisia (non-idempotence du POST, latence de 3 à 6 s, webhooks désordonnés ou dupliqués).
-2. Modélisation relationnelle (`Session`, `Booking`, `WebhookEvent`, `OutboxTask`) et configuration de PostgreSQL (Supabase).
-3. Implémentation du webhook entrant : sécurisation HMAC, idempotence par clé primaire, verrouillage pessimiste `FOR UPDATE`.
-4. Implémentation du flux sortant : découplage asynchrone via `BackgroundTasks` et Transactional Outbox pattern.
-5. Rédaction des arbitrages et documentation.
+1. Lecture des contraintes de l'API Artisia (lenteurs de 3 à 6 secondes, erreurs 500, webhooks envoyés en double).
+2. Modélisation de la base (`sessions`, `bookings`, `webhook_events`, `outbox_tasks`) sur Supabase (PostgreSQL).
+3. Route du webhook : sécurisation par signature HMAC, filtre anti-doublon (idempotence) et verrouillage des places (`SELECT ... FOR UPDATE`).
+4. Réservations locales : utilisation des tâches de fond pour ne jamais bloquer l'artisan quand l'API partenaire rame.
+5. Rédaction du retour d'expérience et des choix d'architecture.
 
-**Ce qui a bloqué :** résolution DNS IPv6 par défaut sur l'URL directe de Supabase sous macOS, résolue en basculant sur le connection pooler en mode Session sur le port 5432.
+**Ce qui m'a bloqué :** un souci de résolution DNS IPv6 avec Supabase sous macOS, corrigé en basculant sur leur pooler de session en IPv4.
 
-**Ce qui a été délibérément laissé de côté :** un cluster RabbitMQ/Celery complet. Pour la volumétrie demandée et le cadre du test, `BackgroundTasks` de FastAPI combiné à la table `outbox_tasks` démontre le découplage asynchrone sans ajouter de dépendance d'infrastructure inutile.
+**Ce que j'ai laissé de côté :** un gestionnaire de tâches lourd comme Celery ou RabbitMQ. Pour le volume d'un atelier et le cadre du test, les tâches de fond de FastAPI associées à la table `outbox_tasks` suffisent largement sans ajouter d'usines à gaz inutiles.
 
 ---
 
 ### 2. Tri des tickets
 
-Classement par appétence personnelle (du plus motivant au moins motivant) :
+Mon classement (du ticket que je prendrais avec le plus d'envie au moins motivant) :
 
 1. Un partenaire a changé le format de ses dates sans prévenir, les réservations n'entrent plus depuis ce matin.
 2. Le calendrier du back-office rame dès qu'un atelier a plus de 200 cours affichés.
@@ -105,47 +109,43 @@ Classement par appétence personnelle (du plus motivant au moins motivant) :
 
 **Ce que ce classement dit de moi :**
 
-Je suis stimulé par les urgences de production, l'optimisation de performance pure et la traque d'anomalies complexes ayant un impact business direct. Je privilégie la fiabilité des tuyaux et la robustesse architecturale par rapport à la maintenance d'UI ou aux tâches cosmétiques.
+J'aime résoudre les pannes concrètes, optimiser ce qui rame et concevoir des systèmes fiables sous le capot. Réaligner des boutons ou modifier des formulaires m'intéresse beaucoup moins que de m'assurer que les données et les flux d'argent sont justes.
 
 ---
 
-### 3. Question ouverte : Deux premières semaines dans l'équipe
+### 3. Mes deux premières semaines dans l'équipe
 
-*Contexte : un produit en production depuis 4 ans avec 70 artisans actifs et une équipe de 3 développeurs.*
+**Semaine 1 — Observer et comprendre le terrain :**
 
-**Semaine 1 — Comprendre sans casser :**
+- Monter l'environnement local de zéro et documenter les blocages pour le prochain arrivant.
+- Passer du temps sur le support client pour voir les vrais problèmes des artisans au quotidien.
+- Pousser une modification mineure en production pour valider le circuit de déploiement.
 
-- **Jour 1-2 :** installer l'environnement de dev local de zéro, noter chaque point de friction et mettre à jour la documentation d'onboarding.
-- **Jour 3 :** prendre 2 ou 3 tickets de support réels et assister à un échange client pour voir comment les artisans utilisent l'outil en pratique.
-- **Jour 4-5 :** livrer une première correction mineure (bugfix ou typo) en production pour tester l'intégralité du pipeline CI/CD et le cycle de déploiement.
+**Semaine 2 — Identifier les fragilités :**
 
-**Semaine 2 — Cartographie des risques :**
-
-- Auditer les logs d'erreurs (Sentry) et identifier les 3 erreurs les plus récurrentes qui polluent le monitoring.
-- Analyser les requêtes lentes et l'usage des index sur les tables à forte écriture (`bookings`, `sessions`).
-- Conclure par un point d'étape avec les deux développeurs pour aligner ma vision sur la dette technique critique identifiée sans chercher à tout réécrire.
+- Regarder les logs d'erreurs récurrentes en production.
+- Vérifier les requêtes qui ralentissent la base sur les réservations.
+- Échanger avec l'équipe sur les deux ou trois points techniques les plus urgents à stabiliser sans vouloir tout refaire.
 
 ---
 
 ### 4. Ce que j'aurais demandé avant de commencer
 
-**La question technique non posée :**
+**Ma question :**
 
-> « Lorsqu'une surréservation simultanée inévitable se produit entre Artisia et Daisy sur la dernière place disponible, quelle est la règle contractuelle de Daisy : Daisy annule-t-il systématiquement le partenaire pour privilégier sa vente directe, ou applique-t-on la stricte antériorité de l'horodatage (`occurred_at`) ? »
+> Quand une surréservation inévitable a lieu en même temps sur la dernière place entre Daisy et Artisia, quelle est la règle métier : est-ce qu'on annule automatiquement le partenaire pour privilégier le client direct de l'artisan, ou est-ce qu'on prend le premier arrivé à la seconde près ?
 
-**L'hypothèse retenue pour avancer :**
+**Mon choix par défaut :**
 
-J'ai supposé que Daisy privilégie la préservation de la cohérence physique de l'atelier sans prise de décision unilatérale destructrice : la réservation partenaire excédentaire est acceptée et marquée en statut de conflit (`conflict_overbooked`), laissant l'artisan arbitrer sans corrompre le stock réel du cours.
+J'ai choisi de ne rien casser automatiquement. La réservation partenaire en trop est marquée en conflit (`conflict_overbooked`), et c'est l'artisan qui tranche en sachant exactement ce qui s'est passé.
 
 ---
 
-## Architecture technique & Choix d'implémentation
+## Stack technique
 
 | Domaine | Choix |
 |---|---|
-| **Framework** | FastAPI (Python 3.13) |
-| **Base de données** | PostgreSQL (hébergé sur Supabase via connection pooler Session) |
-| **ORM** | SQLAlchemy 2.0 |
-| **Stratégie de concurrence** | Pessimistic Locking (`SELECT ... FOR UPDATE`) |
-| **Stratégie d'asynchronisme** | Transactional Outbox Pattern + FastAPI Background Tasks |
-| **Sécurité** | Validation de signature cryptographique HMAC-SHA256 sur les webhooks entrants |
+| **Langage & Framework** | Python 3.13, FastAPI |
+| **Base de données** | PostgreSQL (Supabase) via SQLAlchemy |
+| **Gestion des conflits** | Verrouillage à la ligne (`SELECT ... FOR UPDATE`) |
+| **Résilience API** | Table d'événements pour l'idempotence, table Outbox pour les tâches en arrière-plan |
