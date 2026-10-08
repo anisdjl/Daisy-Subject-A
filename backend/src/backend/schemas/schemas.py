@@ -20,3 +20,9 @@ class ArtisiaWebhookPayload(BaseModel):
 class CreateSessionRequest(BaseModel):
     id: str
     total_capacity: int
+
+class CreateDaisyBookingRequest(BaseModel):
+    session_id: str
+    customer_name: str
+    customer_email: str
+    seats: int = 1
