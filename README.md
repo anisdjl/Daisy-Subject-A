@@ -142,7 +142,7 @@ J'ai choisi de ne rien casser automatiquement. La réservation partenaire en tro
 
 ## Guide de test rapide (via Swagger)
 
-URL Swagger : `https://ton-app.up.railway.app/docs`
+URL Swagger : `https://daisy-subject-a-production.up.railway.app/docs`
 
 ### Étape 1 : Créer un créneau de test
 Route : `POST /sessions`
