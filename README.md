@@ -139,6 +139,103 @@ J'aime résoudre les pannes concrètes, optimiser ce qui rame et concevoir des s
 
 J'ai choisi de ne rien casser automatiquement. La réservation partenaire en trop est marquée en conflit (`conflict_overbooked`), et c'est l'artisan qui tranche en sachant exactement ce qui s'est passé.
 
+
+## Guide de test rapide (via Swagger)
+
+URL Swagger : `https://ton-app.up.railway.app/docs`
+
+### Étape 1 : Créer un créneau de test
+Route : `POST /sessions`
+
+Payload :
+{
+  "id": "ses_poterie_01",
+  "total_capacity": 5
+}
+
+Résultat attendu : Code 201 Created avec `total_capacity: 5`, `daisy_booked: 0`, `partner_booked: 0`.
+
+---
+
+### Étape 2 : Réserver via Daisy (Sync asynchrone Outbox)
+Route : `POST /daisy/bookings`
+
+Payload :
+{
+  "session_id": "ses_poterie_01",
+  "seats": 2
+}
+
+Résultat attendu :
+- Réponse immédiate (< 50 ms) avec code 200 OK et un `booking_id`.
+- La place est verrouillée en local.
+- Une tâche `OutboxTask` est créée en base et traitée en arrière-plan sans bloquer la requête.
+
+---
+
+### Étape 3 : Tester le webhook Artisia et l'idempotence
+Route : `POST /webhook/artisia`
+
+Header HTTP :
+- Laisser `x-artisia-signature` vide ou mettre `dev` (géré par le bypass de signature).
+
+Payload :
+{
+  "event_id": "evt_artisia_1001",
+  "type": "booking.created",
+  "data": {
+    "booking_id": "art_bk_999",
+    "session_id": "ses_poterie_01",
+    "seats": 1
+  }
+}
+
+Résultats attendus :
+1. Premier envoi :
+   - Réponse : `{"status": "processed", "result": "booking_confirmed"}`
+   - Le stock partenaire augmente de 1.
+2. Deuxième envoi (même payload, même event_id) :
+   - Réponse : `{"status": "ignored", "reason": "already_processed", "event_id": "evt_artisia_1001"}`
+   - La contrainte d'unicité sur `event_id` déclenche un rollback : aucun doublon n'est créé et les stocks restent intacts.
+
+---
+
+### Étape 4 : Tester la détection d'overbooking
+Route : `POST /webhook/artisia`
+
+Même session (`ses_poterie_01`), mais avec une demande de places supérieure au stock restant (il ne reste que 2 places disponibles).
+
+Payload :
+{
+  "event_id": "evt_artisia_1002",
+  "type": "booking.created",
+  "data": {
+    "booking_id": "art_bk_surbooking",
+    "session_id": "ses_poterie_01",
+    "seats": 3
+  }
+}
+
+Résultat attendu :
+- Réponse : `{"status": "processed_with_conflict", "alert": "OVERBOOKING_DETECTED", ...}`
+- Le stock ne passe pas en négatif.
+- La réservation est enregistrée avec le statut `conflict_overbooked` pour arbitrage par l'artisan.
+
+---
+
+### Étape 5 : Vérifier l'état final du créneau
+Route : `GET /sessions/ses_poterie_01`
+
+Résultat attendu :
+{
+  "session_id": "ses_poterie_01",
+  "total_capacity": 5,
+  "daisy_booked": 2,
+  "partner_booked": 1,
+  "available_seats": 2
+}
+
+
 ---
 
 ## Stack technique
